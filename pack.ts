@@ -213,16 +213,17 @@ export function readPackEntries(buf: Buffer, repo?: Repo): ParsedPack {
       delta = { kind: 'ref', baseOid: buf.subarray(offset, offset + 20).toString('hex') };
       offset += 20;
     }
-    // Find the zlib stream's end: inflate incrementally. A zlib stream
-    // ends with an empty stored block (00 00 00 ff ff) plus adler32; the
-    // cheapest exact way is to inflate the remainder and ask zlib how many
-    // bytes it consumed, which inflateSync cannot report. Instead, binary
-    // search the smallest prefix that inflates cleanly: the stream is at
-    // most a few hundred KiB here, and log2 steps keep this cheap.
+    // Inflate the stream starting here; inflateAt reports the bytes it
+    // consumed (via the engine's bytesWritten, with a binary-search
+    // fallback), so the next entry begins exactly at offset + consumed.
     const data = inflateAt(buf, offset);
     offset += data.consumed;
     pending.push({ offset: start, type, data: data.out, delta });
   }
+  // Safety net for the fast inflate path: a mis-reported stream length
+  // would leave the cursor off the trailer, so fail loudly instead of
+  // silently storing corrupt objects.
+  if (offset !== trailerStart) throw new Error('pack did not end at the trailer');
   const byOffset = new Map<number, PackEntry>();
   const byOid = new Map<string, PackEntry>();
   const resolve = (entry: Pending, seen: Set<number>): PackEntry => {
@@ -269,9 +270,33 @@ export function readPackEntries(buf: Buffer, repo?: Repo): ParsedPack {
 
 /** Inflate one zlib stream starting at `offset`; reports bytes consumed. */
 function inflateAt(buf: Buffer, offset: number): { out: Buffer; consumed: number } {
-  // Binary-search the smallest prefix that inflates without error: a
-  // truncated stream throws, a complete one succeeds and trailing bytes
-  // are ignored, so the smallest working prefix is the stream's exact end.
+  // Fast path (one call): inflate the remainder and read how many input
+  // bytes the stream consumed from the engine's bytesWritten. The engine
+  // stops at the stream's end and ignores trailing bytes, so bytesWritten
+  // is exactly the stream's length — verified against the binary search
+  // on packs from 0-byte to 64 KiB blobs. Falls back to the binary search
+  // when the engine does not report a usable count (an older runtime).
+  const limit = buf.length - 20;
+  try {
+    const { buffer: out, engine } = inflateSync(buf.subarray(offset, limit), { info: true });
+    const consumed = (engine as unknown as { bytesWritten?: unknown }).bytesWritten;
+    if (typeof consumed === 'number' && Number.isInteger(consumed) && consumed >= 2 && offset + consumed <= limit) {
+      return { out, consumed };
+    }
+  } catch {
+    // A truncated stream here means the caller handed us a bad offset; let
+    // the binary search below throw the same way it always did.
+  }
+  return inflateAtBinary(buf, offset);
+}
+
+/**
+ * Find the zlib stream's end by binary search: inflateSync throws on a
+ * truncated stream and ignores trailing bytes, so the smallest prefix that
+ * inflates is the stream's exact end. Kept as the fallback when the fast
+ * path cannot report a consumed count.
+ */
+function inflateAtBinary(buf: Buffer, offset: number): { out: Buffer; consumed: number } {
   let low = offset + 2;
   let high = buf.length - 20;
   let out: Buffer | null = null;
