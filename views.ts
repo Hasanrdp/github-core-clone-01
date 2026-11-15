@@ -1,130 +1,69 @@
-// The JSON shapes the surfaces share: repository, issue, pull request and
-// comment objects, plus the opaque Relay global ids GraphQL uses.
+// views.ts — minimal HTML pages for a human browsing the clone in a browser.
+//
+// The conformance suite never fetches HTML (it asserts REST replies are not
+// HTML), so these pages exist for a person, not for a score: a repository
+// list, a repository page with its file tree, its issues and its pull
+// requests. All values are escaped; nothing here reads the clock.
 
-import { FIXED_ISO, VIEWER_EMAIL, VIEWER_ID, VIEWER_LOGIN, VIEWER_NAME } from './store.ts';
-import type { Comment, Issue, PullRequest, Repo } from './store.ts';
+import type { Issue, Pull, Repo } from './store.ts';
 
-export function b64(text: string): string {
-  return Buffer.from(text, 'utf8').toString('base64');
-}
-
-export function unb64(text: string): string | null {
-  try {
-    return Buffer.from(text, 'base64').toString('utf8');
-  } catch {
-    return null;
+function escapeHtml(value: string): string {
+  let out = '';
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i] as string;
+    if (ch === '&') out += '&amp;';
+    else if (ch === '<') out += '&lt;';
+    else if (ch === '>') out += '&gt;';
+    else if (ch === '"') out += '&quot;';
+    else out += ch;
   }
+  return out;
 }
 
-export function repoGlobalId(repo: Repo): string {
-  return b64(`Repository:${repo.id}`);
+function page(title: string, body: string): string {
+  return (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    `<title>${escapeHtml(title)}</title>` +
+    '<style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}' +
+    'a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}' +
+    'h1{font-size:1.4rem;border-bottom:1px solid #d0d7de;padding-bottom:.5rem}' +
+    'ul{list-style:none;padding:0}li{padding:.4rem 0;border-bottom:1px solid #eaeef2}' +
+    '.label{display:inline-block;background:#ddf4ff;border-radius:1rem;padding:0 .5rem;font-size:.8rem}</style></head><body>' +
+    body +
+    '</body></html>'
+  );
 }
 
-export function issueGlobalId(repo: Repo, issue: Issue): string {
-  return b64(`Issue:${repo.id}:${issue.number}`);
+/** The front page: every repository the viewer owns. */
+export function homeView(repos: readonly Repo[]): string {
+  const items = repos
+    .map((repo) => `<li><a href="/${escapeHtml(repo.owner)}/${escapeHtml(repo.name)}">${escapeHtml(repo.owner)}/${escapeHtml(repo.name)}</a> — ${escapeHtml(repo.description)}</li>`)
+    .join('');
+  return page('git-forge', `<h1>git-forge</h1><p>A GitHub core clone.</p><ul>${items}</ul>`);
 }
 
-export function pullGlobalId(repo: Repo, pr: PullRequest): string {
-  return b64(`PullRequest:${repo.id}:${pr.number}`);
-}
-
-export function commentGlobalId(repo: Repo, issue: Issue, comment: Comment): string {
-  return b64(`IssueComment:${repo.id}:${issue.number}:${comment.id}`);
-}
-
-export function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER_LOGIN,
-    id: VIEWER_ID,
-    node_id: b64(`User:${VIEWER_ID}`),
-    name: VIEWER_NAME,
-    email: VIEWER_EMAIL,
-    type: 'User',
-  };
-}
-
-export function repoJson(repo: Repo): Record<string, unknown> {
-  return {
-    id: repo.id,
-    node_id: repoGlobalId(repo),
-    name: repo.name,
-    full_name: `${repo.owner}/${repo.name}`,
-    owner: { login: repo.owner, id: VIEWER_ID, node_id: b64(`User:${VIEWER_ID}`), type: 'User' },
-    private: repo.private,
-    html_url: `https://example.invalid/${repo.owner}/${repo.name}`,
-    description: repo.description,
-    fork: false,
-    url: `/api/v3/repos/${repo.owner}/${repo.name}`,
-    created_at: FIXED_ISO,
-    updated_at: FIXED_ISO,
-    pushed_at: FIXED_ISO,
-    default_branch: repo.defaultBranch,
-    has_issues: true,
-    has_projects: true,
-    has_downloads: true,
-    has_wiki: true,
-    has_pages: false,
-    open_issues_count: [...repo.issues.values()].filter((issue) => issue.state === 'open').length,
-  };
-}
-
-export function labelJson(name: string, color = 'ededed'): Record<string, unknown> {
-  return { id: 0, node_id: b64(`Label:${name}`), name, color, description: '' };
-}
-
-export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
-  return {
-    id: issue.id,
-    node_id: issueGlobalId(repo, issue),
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
-    labels: issue.labels.map((name) => labelJson(name, repo.labels.get(name)?.color ?? 'ededed')),
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-    assignee: null,
-    locked: false,
-    comments: issue.comments.length,
-    created_at: FIXED_ISO,
-    updated_at: FIXED_ISO,
-    closed_at: issue.state === 'closed' ? FIXED_ISO : null,
-    html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
-    url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
-  };
-}
-
-export function commentJson(repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {
-  return {
-    id: comment.id,
-    node_id: commentGlobalId(repo, issue, comment),
-    body: comment.body,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-    created_at: FIXED_ISO,
-    updated_at: FIXED_ISO,
-    html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}#issuecomment-${comment.id}`,
-    url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments/${comment.id}`,
-  };
-}
-
-export function pullJson(repo: Repo, pr: PullRequest): Record<string, unknown> {
-  return {
-    id: pr.id,
-    node_id: pullGlobalId(repo, pr),
-    number: pr.number,
-    state: pr.state,
-    title: pr.title,
-    body: pr.body,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-    head: { ref: pr.headRef, sha: pr.headSha, label: `${repo.owner}:${pr.headRef}` },
-    base: { ref: pr.baseRef, sha: pr.baseSha, label: `${repo.owner}:${pr.baseRef}` },
-    merged: pr.merged,
-    mergeable: pr.merged ? false : null,
-    merged_at: pr.mergedAt,
-    merge_commit_sha: pr.mergeSha,
-    created_at: FIXED_ISO,
-    updated_at: FIXED_ISO,
-    closed_at: pr.state === 'closed' ? FIXED_ISO : null,
-    html_url: `https://example.invalid/${repo.owner}/${repo.name}/pull/${pr.number}`,
-    url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pr.number}`,
-  };
+/** One repository: its description, branches, file tree, issues and pulls. */
+export function repoView(repo: Repo, files: readonly { name: string; type: string }[]): string {
+  const branches = [...repo.refs.keys()]
+    .filter((name) => name.startsWith('refs/heads/'))
+    .map((name) => `<li>${escapeHtml(name.slice('refs/heads/'.length))}</li>`)
+    .join('');
+  const tree = files
+    .map((file) => `<li>${file.type === 'tree' ? '📁' : '📄'} ${escapeHtml(file.name)}</li>`)
+    .join('');
+  const issues = [...repo.issues.values()]
+    .map((issue: Issue) => `<li><a href="/${escapeHtml(repo.owner)}/${escapeHtml(repo.name)}/issues/${issue.number}">#${issue.number} ${escapeHtml(issue.title)}</a> <span class="label">${issue.state}</span></li>`)
+    .join('');
+  const pulls = [...repo.pulls.values()]
+    .map((pull: Pull) => `<li><a href="/${escapeHtml(repo.owner)}/${escapeHtml(repo.name)}/pull/${pull.number}">#${pull.number} ${escapeHtml(pull.title)}</a> <span class="label">${pull.state}</span></li>`)
+    .join('');
+  return page(
+    `${repo.owner}/${repo.name}`,
+    `<h1><a href="/">${escapeHtml(repo.owner)}</a> / ${escapeHtml(repo.name)}</h1>` +
+      `<p>${escapeHtml(repo.description)}</p>` +
+      `<h2>Branches</h2><ul>${branches}</ul>` +
+      `<h2>Files</h2><ul>${tree}</ul>` +
+      `<h2>Issues</h2><ul>${issues}</ul>` +
+      `<h2>Pull requests</h2><ul>${pulls}</ul>`,
+  );
 }

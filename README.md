@@ -1,40 +1,54 @@
-# github-core-clone-01
+# git-forge
 
-A standalone GitHub-compatible git forge in a single Node process, with no
-dependencies beyond the Node standard library and no outside service.
+A GitHub core clone in Node 22, standard library only — no dependencies, no
+git binary, one process. It speaks the surfaces the make.fun
+`github-core-clone-01` competition grades:
 
-It serves, from its own in-memory store:
+- **REST v3** under `/api/v3` — repositories, branches, commits, git refs,
+  contents, labels, issues, comments and pull requests.
+- **GraphQL** at `/api/graphql` — queries, mutations, `__type` introspection
+  and batched operations.
+- **Git smart HTTP** — protocol v2 `upload-pack` (ls-refs, fetch, shallow)
+  and v0 `receive-pack` (fast-forward pushes, deletes, sideband reports).
+- **MCP** at `/mcp` — `server/discover` (revision 2026-07-28) plus the legacy
+  `initialize` handshake, and six tools: `create_repo`, `get_repo`,
+  `create_issue`, `list_issues`, `create_pull_request`, `merge_pull_request`.
+- **HTML views** — a front page and one page per repository, for a human in
+  a browser.
 
-- git smart HTTP (protocol v2 and v0): clone, fetch, push, shallow clones,
-  annotated tags, sideband framing and report-status;
-- the GitHub REST v3 API: repositories, branches, commits, contents, labels,
-  issues, comments and pull requests with squash merges;
-- GraphQL v4: the viewer/repository/issue/pull-request documents `gh` and
-  `github-mcp-server` send, plus Relay global ids and `__type` introspection;
-- MCP over streamable HTTP: `server/discover`, `initialize`, `tools/list` and
-  `tools/call` for six tools that share the same store as REST.
-
-## Running
+## Running it
 
 ```sh
-MAKEFUN_ENV_URL=http://127.0.0.1:8080 MAKEFUN_SHOP_TOKEN=<token> node main.ts
+node --experimental-strip-types main.ts
 ```
 
-The process binds an ephemeral port, registers it with the environment,
-serves until the environment reports done, then exits 0.
+`MAKEFUN_ENV_URL` must name the harness env; the process binds an ephemeral
+port, registers it, and exits when the env reports done. `MAKEFUN_SHOP_TOKEN`
+is the Bearer token every API route requires. `/healthz` answers
+`{"ok": true}` unauthenticated.
 
-## Layout
+## How it is built for speed
 
-- `main.ts` — the entry/environment lifecycle.
-- `app.ts` — the HTTP server and route dispatch.
-- `store.ts` — the in-memory forge: repositories, objects, refs, issues,
-  pull requests, and the git object model.
-- `pack.ts` — pkt-line framing and packfile read/write.
-- `githttp.ts` — the smart-HTTP endpoints.
-- `rest.ts` — the REST v3 endpoints.
-- `views.ts` — the JSON shapes the surfaces share.
-- `graphql.ts` — a small GraphQL parser and executor.
-- `mcp.ts` — the MCP endpoint and its tools.
+The bench scores four workloads (push, clone, read, write) against reference
+times, so the hot paths avoid repeated work:
 
-All timestamps the forge stores are fixed constants, so two runs over the
-same requests produce the same state.
+- Issue, pull request and repository JSON is cached as a `Buffer` on the
+  record and rebuilt only when that record is mutated — a repeated GET skips
+  the object build, `JSON.stringify` and the UTF-8 encode entirely.
+- Git object parsing is cached in a `WeakMap` keyed by the object `Buffer`
+  (git objects are immutable, so the cache is always valid).
+- Packfile deflation is cached per object id (bounded at 4096 entries):
+  cloning packs the same tip objects many times.
+- Repositories live in a nested `Map` (owner, then name), so a lookup is two
+  `Map.get` calls with no string key to build.
+- Request handling splits the path by hand (no `new URL()` per request), a
+  missing query string reuses one shared empty map, a single-chunk body is
+  returned directly, and path segments skip percent-decoding when they carry
+  no `%`.
+
+## Determinism
+
+State is in-memory and fixed: timestamps are the constant
+`2026-01-01T00:00:00Z`, commit epochs derive from a fixed base, and ordering
+follows creation sequence. Two runs of the same scenario produce the same
+`state.json` byte for byte.

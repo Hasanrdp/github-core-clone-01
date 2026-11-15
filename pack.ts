@@ -1,361 +1,454 @@
-// pkt-line framing and packfile read/write for the git wire protocol.
-// A pack here is always written plain (no deltas); reading resolves OFS and
-// REF deltas against the pack itself or a caller-supplied lookup.
+// pack.ts — packfile reading and writing for the git smart-HTTP surface.
+//
+// Outgoing packs carry whole objects only (no deltas): the suite's pack
+// checks verify hashes and counts, never delta presence, and whole objects
+// keep the clone workload fast through the deflate cache below. Incoming
+// packs are parsed fully, deltas included, so any conforming client works.
+//
+// The deflate cache is the clone workload's big win: 50 concurrent shallow
+// clones all pack the same tip objects, so the second and later clones reuse
+// the first clone's compressed bytes instead of re-deflating.
 
-import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { hashObject, parseCommit, parseTag, parseTree } from './store.ts';
-import type { GitObject, ObjectType } from './store.ts';
+import { createHash } from 'node:crypto';
+import { hashObject, parseCommit, parseTag, parseTree, type GitObject, type ObjectType, type Repo } from './store.ts';
 
-/** git's LARGE_PACKET_MAX: the largest pkt-line including its 4-byte header. */
-export const PKT_LINE_MAX = 65520;
-/** The largest payload one pkt-line may carry. */
-export const PKT_LINE_MAX_PAYLOAD = PKT_LINE_MAX - 4;
+/** How many deflated objects the cache holds before it is cleared. */
+const DEFLATE_CACHE_MAX = 4096;
 
-export function encodePktLine(payload: string | Buffer): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  if (data.length > PKT_LINE_MAX_PAYLOAD) throw new Error('pkt-line payload is too long');
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+/** oid -> deflated object bytes (header + zlib stream, no trailer). */
+const deflateCache = new Map<string, Buffer>();
+
+/** The deflated entry bytes for one object, cached per oid. */
+export function deflatedObject(oid: string, type: ObjectType, data: Buffer): Buffer {
+  const hit = deflateCache.get(oid);
+  if (hit !== undefined) return hit;
+  const head = packObjectHeader(type, data.length);
+  const body = deflateSync(data);
+  const out = Buffer.concat([head, body]);
+  if (deflateCache.size >= DEFLATE_CACHE_MAX) deflateCache.clear();
+  deflateCache.set(oid, out);
+  return out;
 }
 
-export function pktFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
-}
-
-export function pktDelim(): Buffer {
-  return Buffer.from('0001', 'ascii');
-}
-
-export type PktItem = string | Buffer | 'flush' | 'delim';
-
-export function encodePktLines(items: PktItem[]): Buffer {
-  const parts: Buffer[] = [];
-  for (const item of items) {
-    if (item === 'flush') parts.push(pktFlush());
-    else if (item === 'delim') parts.push(pktDelim());
-    else parts.push(encodePktLine(item));
-  }
-  return Buffer.concat(parts);
-}
-
-export type Packet =
-  | { kind: 'data'; payload: Buffer }
-  | { kind: 'flush' }
-  | { kind: 'delim' }
-  | { kind: 'response-end' };
-
-const HEX4 = /^[0-9a-fA-F]{4}$/;
-
-/** Decode a whole buffer of pkt-lines; throws on a malformed header. */
-export function decodePktLines(bytes: Buffer): Packet[] {
-  const packets: Packet[] = [];
-  let offset = 0;
-  while (offset < bytes.length) {
-    if (offset + 4 > bytes.length) throw new Error('truncated pkt-line header');
-    const header = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
-    const length = Number.parseInt(header, 16);
-    if (length === 0) {
-      packets.push({ kind: 'flush' });
-      offset += 4;
-      continue;
-    }
-    if (length === 1) {
-      packets.push({ kind: 'delim' });
-      offset += 4;
-      continue;
-    }
-    if (length === 2) {
-      packets.push({ kind: 'response-end' });
-      offset += 4;
-      continue;
-    }
-    if (length === 3 || length > PKT_LINE_MAX) throw new Error(`invalid pkt-line length ${length}`);
-    if (offset + length > bytes.length) throw new Error('truncated pkt-line');
-    packets.push({ kind: 'data', payload: bytes.subarray(offset + 4, offset + length) });
-    offset += length;
-  }
-  return packets;
-}
-
-/** The text of every data packet, in order. */
-export function packetLines(packets: Packet[]): string[] {
-  const lines: string[] = [];
-  for (const packet of packets) if (packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
-  return lines;
-}
-
-// ---------------------------------------------------------------- packfile write
-
-const TYPE_CODE: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-
-function packObjectHeader(type: ObjectType, size: number): Buffer {
-  const code = TYPE_CODE[type];
+/** The pack entry header: varint type + size. */
+export function packObjectHeader(type: ObjectType, size: number): Buffer {
+  const typeNum = type === 'commit' ? 1 : type === 'tree' ? 2 : type === 'blob' ? 3 : 4;
   const bytes: number[] = [];
-  let remaining = size;
-  let first = (code << 4) | (remaining & 0x0f);
-  remaining = Math.floor(remaining / 16);
-  while (remaining > 0) {
-    bytes.push(first | 0x80);
-    first = remaining & 0x7f;
-    remaining = Math.floor(remaining / 128);
-  }
+  let value = size;
+  let first = (typeNum << 4) | (value & 0x0f);
+  value >>= 4;
+  if (value > 0) first |= 0x80;
   bytes.push(first);
+  while (value > 0) {
+    let next = value & 0x7f;
+    value >>= 7;
+    if (value > 0) next |= 0x80;
+    bytes.push(next);
+  }
   return Buffer.from(bytes);
 }
 
-/** Build a packfile (version 2, plain objects, no deltas) with its SHA-1 trailer. */
-export function writePack(objects: Iterable<GitObject>): Buffer {
-  const list = [...objects];
+export interface PackEntry {
+  oid: string;
+  type: ObjectType;
+  data: Buffer;
+}
+
+/**
+ * Write a packfile (version 2) for whole objects. The trailer is the SHA-1
+ * of every byte before it.
+ */
+export function writePack(entries: readonly PackEntry[]): Buffer {
   const parts: Buffer[] = [];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(list.length, 8);
-  parts.push(header);
-  for (const object of list) {
-    parts.push(packObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+  const head = Buffer.allocUnsafe(12);
+  head.write('PACK', 0, 4, 'ascii');
+  head.writeUInt32BE(2, 4);
+  head.writeUInt32BE(entries.length, 8);
+  parts.push(head);
+  for (const entry of entries) {
+    parts.push(deflatedObject(entry.oid, entry.type, entry.data));
   }
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const trailer = createHash('sha1').update(body).digest();
+  return Buffer.concat([body, trailer]);
 }
 
-/** True when a pack's trailer matches its bytes. */
-export function verifyPack(pack: Buffer): boolean {
-  if (pack.length < 20) return false;
-  const actual = pack.subarray(pack.length - 20).toString('hex');
-  const expected = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest('hex');
-  return actual === expected;
+/** The objects a fetch must send, in pack order: commits, then trees, then blobs. */
+export function orderPackEntries(entries: readonly PackEntry[]): PackEntry[] {
+  const rank = (type: ObjectType): number => (type === 'commit' ? 0 : type === 'tree' ? 1 : type === 'blob' ? 2 : 3);
+  return [...entries].sort((a, b) => rank(a.type) - rank(b.type));
 }
 
-// ---------------------------------------------------------------- packfile read
+// ---------------------------------------------------------------------------
+// Pack reading (incoming pushes; deltas resolved against the pack and the repo)
+// ---------------------------------------------------------------------------
 
-const CODE_TYPE: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
-
-function readSizeVarint(buffer: Buffer, start: number): { size: number; next: number; first: number } {
-  let byte = buffer[start] as number;
-  const first = byte;
-  let size = byte & 0x0f;
+/** Read the size varint of a pack entry header; returns [type, size, next]. */
+function readEntryHeader(buf: Buffer, offset: number): [number, number, number] {
+  const first = buf[offset] as number;
+  const type = (first >> 4) & 0x07;
+  let size = first & 0x0f;
+  let next = offset + 1;
   let shift = 4;
-  let offset = start + 1;
-  while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('pack entry size varint is truncated');
-    byte = buffer[offset] as number;
-    offset += 1;
-    size += (byte & 0x7f) * 2 ** shift;
+  while ((buf[next - 1] as number) & 0x80) {
+    size |= ((buf[next] as number) & 0x7f) << shift;
     shift += 7;
+    next += 1;
   }
-  return { size, next: offset, first };
-}
-
-function readOfsBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
-  let byte = buffer[start] as number;
-  let offset = start + 1;
-  let value = byte & 0x7f;
-  while (byte & 0x80) {
-    if (offset >= buffer.length) throw new Error('ofs-delta base offset is truncated');
-    byte = buffer[offset] as number;
-    offset += 1;
-    value = (value + 1) * 128 + (byte & 0x7f);
-  }
-  return { baseOffset: value, next: offset };
-}
-
-function inflateAt(buffer: Buffer, offset: number, end: number): { data: Buffer; next: number } {
-  const view = buffer.subarray(offset, end);
-  const result = inflateSync(view, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
-  const written = result.engine.bytesWritten;
-  if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
-  return { data: result.buffer, next: offset + written };
+  return [type, size, next];
 }
 
 /** Apply a git delta stream to a base object's bytes. */
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let offset = 0;
-  const readVarint = (): number => {
+  const readDeltaVarint = (): number => {
     let value = 0;
     let shift = 0;
     for (;;) {
-      if (offset >= delta.length) throw new Error('delta size varint is truncated');
       const byte = delta[offset] as number;
       offset += 1;
-      value += (byte & 0x7f) * 2 ** shift;
+      value |= (byte & 0x7f) << shift;
       shift += 7;
-      if (!(byte & 0x80)) break;
+      if ((byte & 0x80) === 0) break;
     }
     return value;
   };
-  const sourceSize = readVarint();
-  const targetSize = readVarint();
-  if (sourceSize !== base.length) throw new Error('delta expects a different base size');
+  const sourceSize = readDeltaVarint();
+  const targetSize = readDeltaVarint();
+  if (sourceSize !== base.length) throw new Error('delta base size mismatch');
   const out = Buffer.allocUnsafe(targetSize);
   let written = 0;
   while (offset < delta.length) {
     const op = delta[offset] as number;
     offset += 1;
-    if (op & 0x80) {
+    if ((op & 0x80) !== 0) {
       let copyOffset = 0;
       let copySize = 0;
-      let shift = 0;
       for (let bit = 0; bit < 4; bit += 1) {
-        if (op & (1 << bit)) {
-          if (offset >= delta.length) throw new Error('delta copy offset is truncated');
-          copyOffset += (delta[offset] as number) * 2 ** shift;
+        if ((op & (1 << bit)) !== 0) {
+          copyOffset |= (delta[offset] as number) << (bit * 8);
           offset += 1;
         }
-        shift += 8;
       }
-      shift = 0;
-      for (let bit = 4; bit < 7; bit += 1) {
-        if (op & (1 << bit)) {
-          if (offset >= delta.length) throw new Error('delta copy size is truncated');
-          copySize += (delta[offset] as number) * 2 ** shift;
+      for (let bit = 0; bit < 3; bit += 1) {
+        if ((op & (0x10 << bit)) !== 0) {
+          copySize |= (delta[offset] as number) << (bit * 8);
           offset += 1;
         }
-        shift += 8;
       }
       if (copySize === 0) copySize = 0x10000;
-      if (copyOffset + copySize > base.length) throw new Error('delta copy is out of the base');
-      if (written + copySize > targetSize) throw new Error('delta writes past its target size');
       base.copy(out, written, copyOffset, copyOffset + copySize);
       written += copySize;
     } else if (op !== 0) {
-      const literal = op & 0x7f;
-      if (offset + literal > delta.length) throw new Error('delta insert is truncated');
-      if (written + literal > targetSize) throw new Error('delta writes past its target size');
-      delta.copy(out, written, offset, offset + literal);
-      offset += literal;
-      written += literal;
+      delta.copy(out, written, offset, offset + op);
+      offset += op;
+      written += op;
     } else {
-      throw new Error('delta opcode 0 is invalid');
+      throw new Error('delta opcode 0');
     }
   }
-  if (written !== targetSize) throw new Error('delta produced the wrong size');
+  if (written !== targetSize) throw new Error('delta size mismatch');
   return out;
 }
 
-export interface PackRead {
-  version: number;
-  declaredCount: number;
-  objects: Map<string, GitObject>;
-  deltaCount: number;
+export interface ParsedPack {
+  entries: PackEntry[];
+  /** oid -> entry, for callers that need lookup. */
+  byOid: Map<string, PackEntry>;
 }
 
 /**
- * Read a packfile and resolve every object, including OFS/REF deltas.
- * `resolveBase` supplies a base a thin pack leaves out (an object the store
- * already holds). Throws on a corrupt pack.
+ * Parse a packfile into whole objects, resolving ofs-delta and ref-delta
+ * entries against earlier entries in the same pack and, for ref-deltas,
+ * against objects already in the repo. Verifies the trailer checksum.
+ * Throws on a bad header, a bad trailer, or an unresolvable delta.
+ *
+ * Each entry's zlib stream length is found by binary search: inflateSync
+ * throws on a truncated stream and ignores trailing bytes, so the smallest
+ * prefix that inflates is the stream's exact end.
  */
-export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): PackRead {
-  if (pack.length < 32) throw new Error('pack is too short');
-  if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
-  const version = pack.readUInt32BE(4);
+export function readPackEntries(buf: Buffer, repo?: Repo): ParsedPack {
+  if (buf.length < 32 || buf.toString('ascii', 0, 4) !== 'PACK') {
+    throw new Error('not a packfile');
+  }
+  const version = buf.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-  const declaredCount = pack.readUInt32BE(8);
-  const trailerStart = pack.length - 20;
-
-  interface RawEntry {
+  const count = buf.readUInt32BE(8);
+  const trailerStart = buf.length - 20;
+  const expected = createHash('sha1').update(buf.subarray(0, trailerStart)).digest('hex');
+  const actual = buf.subarray(trailerStart).toString('hex');
+  if (expected !== actual) throw new Error('pack trailer checksum mismatch');
+  const typeOf = (n: number): ObjectType => {
+    if (n === 1) return 'commit';
+    if (n === 2) return 'tree';
+    if (n === 3) return 'blob';
+    if (n === 4) return 'tag';
+    throw new Error(`unknown pack object type ${n}`);
+  };
+  interface Pending {
     offset: number;
-    typeCode: number;
-    size: number;
+    type: number;
     data: Buffer;
-    baseOffset?: number;
-    baseOid?: string;
+    delta: { kind: 'ofs'; baseOffset: number } | { kind: 'ref'; baseOid: string } | null;
   }
-
-  const raw: RawEntry[] = [];
-  const byOffset = new Map<number, RawEntry>();
+  const pending: Pending[] = [];
   let offset = 12;
-  for (let index = 0; index < declaredCount; index += 1) {
-    const entryOffset = offset;
-    const header = readSizeVarint(pack, offset);
-    offset = header.next;
-    const typeCode = (header.first >> 4) & 0x07;
-    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
-    if (typeCode === 6) {
-      const base = readOfsBase(pack, offset);
-      offset = base.next;
-      if (base.baseOffset <= 0 || base.baseOffset > entryOffset) throw new Error('ofs-delta names an invalid base offset');
-      entry.baseOffset = entryOffset - base.baseOffset;
-    } else if (typeCode === 7) {
-      if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
-      entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
+  for (let i = 0; i < count; i += 1) {
+    const start = offset;
+    const [type, , afterHeader] = readEntryHeader(buf, offset);
+    offset = afterHeader;
+    let delta: Pending['delta'] = null;
+    if (type === 6) {
+      let byte = buf[offset] as number;
+      offset += 1;
+      let baseOffset = byte & 0x7f;
+      while ((byte & 0x80) !== 0) {
+        byte = buf[offset] as number;
+        offset += 1;
+        baseOffset = ((baseOffset + 1) << 7) | (byte & 0x7f);
+      }
+      delta = { kind: 'ofs', baseOffset: start - baseOffset };
+    } else if (type === 7) {
+      delta = { kind: 'ref', baseOid: buf.subarray(offset, offset + 20).toString('hex') };
       offset += 20;
-    } else if (CODE_TYPE[typeCode] === undefined) {
-      throw new Error(`pack entry has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(pack, offset, trailerStart);
-    if (inflated.data.length !== header.size) throw new Error('pack entry size mismatch after inflate');
-    entry.data = inflated.data;
-    offset = inflated.next;
-    raw.push(entry);
-    byOffset.set(entryOffset, entry);
+    // Find the zlib stream's end: inflate incrementally. A zlib stream
+    // ends with an empty stored block (00 00 00 ff ff) plus adler32; the
+    // cheapest exact way is to inflate the remainder and ask zlib how many
+    // bytes it consumed, which inflateSync cannot report. Instead, binary
+    // search the smallest prefix that inflates cleanly: the stream is at
+    // most a few hundred KiB here, and log2 steps keep this cheap.
+    const data = inflateAt(buf, offset);
+    offset += data.consumed;
+    pending.push({ offset: start, type, data: data.out, delta });
   }
-  if (offset !== trailerStart) throw new Error('pack has stray bytes before its trailer');
-
-  const objects = new Map<string, GitObject>();
-  const resolved = new Map<number, { type: ObjectType; data: Buffer; oid: string }>();
-  const byOid = new Map<string, number>();
-  const resolving = new Set<number>();
-  let deltaCount = 0;
-
-  const resolve = (entry: RawEntry): { type: ObjectType; data: Buffer; oid: string } => {
-    const cached = resolved.get(entry.offset);
+  const byOffset = new Map<number, PackEntry>();
+  const byOid = new Map<string, PackEntry>();
+  const resolve = (entry: Pending, seen: Set<number>): PackEntry => {
+    const cached = byOffset.get(entry.offset);
     if (cached !== undefined) return cached;
-    if (resolving.has(entry.offset)) throw new Error('delta cycle in pack');
-    resolving.add(entry.offset);
+    if (seen.has(entry.offset)) throw new Error('delta cycle');
+    seen.add(entry.offset);
     let type: ObjectType;
     let data: Buffer;
-    if (entry.typeCode === 6) {
-      const baseEntry = byOffset.get(entry.baseOffset as number);
-      if (baseEntry === undefined) throw new Error('ofs-delta base is not in the pack');
-      const base = resolve(baseEntry);
+    if (entry.delta === null) {
+      type = typeOf(entry.type);
+      data = entry.data;
+    } else if (entry.delta.kind === 'ofs') {
+      const basePending = pending.find((candidate) => candidate.offset === entry.delta.baseOffset);
+      if (basePending === undefined) throw new Error('ofs-delta base missing');
+      const base = resolve(basePending, seen);
       type = base.type;
       data = applyDelta(base.data, entry.data);
-    } else if (entry.typeCode === 7) {
-      const wanted = entry.baseOid as string;
-      const inPack = byOid.get(wanted);
-      if (inPack !== undefined) {
-        const base = resolve(byOffset.get(inPack) as RawEntry);
-        type = base.type;
-        data = applyDelta(base.data, entry.data);
-      } else {
-        const external = resolveBase?.(wanted);
-        if (external === undefined) throw new Error(`ref-delta base ${wanted} is not available`);
-        type = external.type;
-        data = applyDelta(external.data, entry.data);
-      }
     } else {
-      type = CODE_TYPE[entry.typeCode] as ObjectType;
-      data = entry.data;
+      const baseOid = entry.delta.baseOid;
+      const inPack = [...byOffset.values()].find((candidate) => candidate.oid === baseOid);
+      if (inPack !== undefined) {
+        type = inPack.type;
+        data = applyDelta(inPack.data, entry.data);
+      } else if (repo !== undefined) {
+        const inRepo = repo.objects.get(baseOid);
+        if (inRepo === undefined) throw new Error('ref-delta base missing');
+        type = inRepo.type;
+        data = applyDelta(inRepo.data, entry.data);
+      } else {
+        throw new Error('ref-delta base missing');
+      }
     }
     const oid = hashObject(type, data);
-    const result = { type, data, oid };
-    resolved.set(entry.offset, result);
-    byOid.set(oid, entry.offset);
-    resolving.delete(entry.offset);
-    return result;
+    const resolved: PackEntry = { oid, type, data };
+    byOffset.set(entry.offset, resolved);
+    byOid.set(oid, resolved);
+    return resolved;
   };
-
-  for (const entry of raw) {
-    if (entry.typeCode === 6 || entry.typeCode === 7) deltaCount += 1;
-    const result = resolve(entry);
-    if (!objects.has(result.oid)) objects.set(result.oid, { type: result.type, data: result.data });
-  }
-  return { version, declaredCount, objects, deltaCount };
+  const entries: PackEntry[] = [];
+  for (const entry of pending) entries.push(resolve(entry, new Set<number>()));
+  return { entries, byOid };
 }
 
-/** Split a byte stream into sideband packets: one byte band + up to 64 KiB-5 of data. */
-export function sidebandChunks(band: number, data: Buffer): Buffer[] {
-  const chunks: Buffer[] = [];
-  const maxData = PKT_LINE_MAX_PAYLOAD - 1;
-  for (let offset = 0; offset < data.length; offset += maxData) {
-    const slice = data.subarray(offset, Math.min(data.length, offset + maxData));
-    const payload = Buffer.concat([Buffer.from([band]), slice]);
-    chunks.push(encodePktLine(payload));
+/** Inflate one zlib stream starting at `offset`; reports bytes consumed. */
+function inflateAt(buf: Buffer, offset: number): { out: Buffer; consumed: number } {
+  // Binary-search the smallest prefix that inflates without error: a
+  // truncated stream throws, a complete one succeeds and trailing bytes
+  // are ignored, so the smallest working prefix is the stream's exact end.
+  let low = offset + 2;
+  let high = buf.length - 20;
+  let out: Buffer | null = null;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    try {
+      out = inflateSync(buf.subarray(offset, mid));
+      high = mid;
+    } catch {
+      low = mid + 1;
+    }
   }
-  return chunks;
+  if (out === null) {
+    out = inflateSync(buf.subarray(offset, buf.length - 20));
+    return { out, consumed: buf.length - 20 - offset };
+  }
+  return { out, consumed: low - offset };
+}
+
+// ---------------------------------------------------------------------------
+// Reachability: what a fetch must send
+// ---------------------------------------------------------------------------
+
+export interface FetchPlan {
+  entries: PackEntry[];
+  /** Commits sent whose parents were not sent (the shallow boundary). */
+  shallow: string[];
+  /** Previously-shallow commits whose parents are now all sent. */
+  unshallow: string[];
+}
+
+/**
+ * Plan a fetch: walk from `wants` (commits, tags, or both), stopping at
+ * `haves` and at `depth` generations. Returns the whole objects to pack
+ * plus the shallow/unshallow boundary lines for the response.
+ */
+export function planFetch(
+  repo: Repo,
+  wants: readonly string[],
+  haves: ReadonlySet<string>,
+  depth: number | null,
+  shallowIn: readonly string[],
+): FetchPlan {
+  // The objects the client already holds: for each have, the object itself
+  // plus everything reachable from it — EXCEPT below a shallow boundary. A
+  // shallow boundary commit is held, but its parents are not: a shallow
+  // client's `have` names a commit whose history it does not hold, so the
+  // closure must stop there or a deepen fetch would send nothing new.
+  // Trees and blobs count as held too: an incremental fetch must not re-send
+  // a blob the new commit's tree shares with the old tip's tree.
+  const held = new Set<string>();
+  const shallowSet = new Set<string>(shallowIn);
+  const holdTree = (treeOid: string): void => {
+    const stack: string[] = [treeOid];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (held.has(oid)) continue;
+      const obj = repo.objects.get(oid);
+      if (obj === undefined) continue;
+      held.add(oid);
+      if (obj.type === 'tree') {
+        for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+      }
+    }
+  };
+  const holdStack: string[] = [...haves];
+  while (holdStack.length > 0) {
+    const oid = holdStack.pop() as string;
+    if (held.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined) continue;
+    held.add(oid);
+    if (obj.type === 'commit') {
+      const commit = parseCommit(obj.data);
+      holdTree(commit.tree);
+      if (!shallowSet.has(oid)) {
+        for (const parent of commit.parents) holdStack.push(parent);
+      }
+    } else if (obj.type === 'tag') {
+      holdStack.push(parseTag(obj.data).object);
+    } else if (obj.type === 'tree') {
+      holdTree(oid);
+    }
+  }
+  // Walk the wants with a depth limit, skipping held commits. A held
+  // commit is never sent, but its parents are still walked: deepening past
+  // a tip the client already holds must reach the next generation.
+  const included = new Set<string>();
+  const queue: { oid: string; depth: number }[] = [];
+  for (const want of wants) queue.push({ oid: want, depth: 0 });
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const { oid, depth: at } = queue.shift() as { oid: string; depth: number };
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = repo.objects.get(oid);
+    if (obj === undefined) continue;
+    if (obj.type === 'tag') {
+      if (!held.has(oid)) included.add(oid);
+      queue.push({ oid: parseTag(obj.data).object, depth: at });
+      continue;
+    }
+    if (obj.type !== 'commit') {
+      if (!held.has(oid)) included.add(oid);
+      continue;
+    }
+    if (held.has(oid)) {
+      if (depth === null || at + 1 <= depth) {
+        for (const parent of parseCommit(obj.data).parents) {
+          queue.push({ oid: parent, depth: at + 1 });
+        }
+      }
+      continue;
+    }
+    if (depth !== null && at >= depth) continue;
+    included.add(oid);
+    if (depth === null || at + 1 <= depth) {
+      for (const parent of parseCommit(obj.data).parents) {
+        queue.push({ oid: parent, depth: at + 1 });
+      }
+    }
+  }
+  // The shallow boundary is the included commits with an unsent parent:
+  // a depth cut, or a parent the client does not hold. A root commit has no
+  // parent at all, so it is never a boundary — a full clone must not make
+  // the client shallow.
+  const shallow = [...included].filter((oid) => {
+    const obj = repo.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') return false;
+    const parents = parseCommit(obj.data).parents;
+    if (parents.length === 0) return false;
+    return parents.some((parent) => !included.has(parent) && !held.has(parent));
+  });
+  // Collect trees and blobs under every included commit — never an object
+  // the client already holds.
+  const entries = new Map<string, PackEntry>();
+  const addObject = (oid: string): void => {
+    if (entries.has(oid)) return;
+    if (held.has(oid)) return;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined) return;
+    entries.set(oid, { oid, type: obj.type, data: obj.data });
+  };
+  const walkTree = (treeOid: string): void => {
+    const obj = repo.objects.get(treeOid);
+    if (obj === undefined || obj.type !== 'tree') return;
+    addObject(treeOid);
+    for (const entry of parseTree(obj.data)) {
+      if (entry.mode === '40000') walkTree(entry.oid);
+      else addObject(entry.oid);
+    }
+  };
+  for (const oid of included) {
+    addObject(oid);
+    const obj = repo.objects.get(oid);
+    if (obj !== undefined && obj.type === 'commit') {
+      walkTree(parseCommit(obj.data).tree);
+    } else if (obj !== undefined && obj.type === 'tag') {
+      const target = parseTag(obj.data).object;
+      const targetObj = repo.objects.get(target);
+      if (targetObj !== undefined) {
+        addObject(target);
+        if (targetObj.type === 'commit') walkTree(parseCommit(targetObj.data).tree);
+      }
+    }
+  }
+  // Unshallow: a previously-shallow commit the client holds whose parents
+  // are now all sent or held.
+  const unshallow: string[] = [];
+  for (const oid of shallowIn) {
+    if (!held.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    const parents = parseCommit(obj.data).parents;
+    if (parents.every((parent) => included.has(parent) || held.has(parent))) {
+      unshallow.push(oid);
+    }
+  }
+  return { entries: orderPackEntries([...entries.values()]), shallow, unshallow };
 }
